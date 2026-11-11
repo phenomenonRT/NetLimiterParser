@@ -1,0 +1,193 @@
+name: Build and release
+
+run-name: Build release ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег релиза: v1.2.3 или 1.2.3"
+        required: true
+        default: "v1.1.0"
+        type: string
+      prerelease:
+        description: "Опубликовать как pre-release"
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: "Создать как черновик"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build and publish
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate version and patch AssemblyInfo
+        id: version
+        shell: pwsh
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          $tag = $env:TAG_INPUT.Trim()
+          if ($tag -notmatch '^[vV]?(\d{1,5}(?:\.\d{1,5}){2,3})$') {
+              throw "Тег должен иметь вид v1.2.3 или 1.2.3 (необязательно 4-я цифра)."
+          }
+
+          $parts = @($Matches[1].Split('.') | ForEach-Object { [int]$_ })
+          foreach ($part in $parts) {
+              if ($part -gt 65534) {
+                  throw "Компонент версии $part больше допустимого значения 65534."
+              }
+          }
+
+          $numeric = $parts -join '.'
+          if ($parts.Count -eq 3) {
+              $assemblyVersion = "$numeric.0"
+          } else {
+              $assemblyVersion = $numeric
+          }
+          $tag = "v$numeric"
+
+          $assemblyInfo = Join-Path $env:GITHUB_WORKSPACE 'src\AssemblyInfo.cs'
+          $content = [System.IO.File]::ReadAllText($assemblyInfo)
+          $content = [System.Text.RegularExpressions.Regex]::Replace(
+              $content,
+              'AssemblyVersion\("[^"]+"\)',
+              ('AssemblyVersion("' + $assemblyVersion + '")'))
+          $content = [System.Text.RegularExpressions.Regex]::Replace(
+              $content,
+              'AssemblyFileVersion\("[^"]+"\)',
+              ('AssemblyFileVersion("' + $assemblyVersion + '")'))
+          [System.IO.File]::WriteAllText(
+              $assemblyInfo,
+              $content,
+              (New-Object System.Text.UTF8Encoding($false)))
+
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "tag=$tag" -Encoding utf8
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$assemblyVersion" -Encoding utf8
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "display=$numeric" -Encoding utf8
+
+          Write-Host "Release tag: $tag"
+          Write-Host "Assembly version: $assemblyVersion"
+          Select-String -Path $assemblyInfo -Pattern 'AssemblyVersion|AssemblyFileVersion' |
+              ForEach-Object { $_.Line }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+          if ($LASTEXITCODE -ne 0) {
+              throw "Сборка завершилась с ошибкой (код $LASTEXITCODE)."
+          }
+
+      - name: Verify build and create checksum
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'NetLimiterParser.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+              throw "Не найден собранный файл NetLimiterParser.exe."
+          }
+
+          $file = Get-Item -LiteralPath $exe
+          $actualVersion = $file.VersionInfo.FileVersion
+          if ($actualVersion -ne $env:VERSION) {
+              throw "Версия файла $actualVersion не совпадает с ожидаемой $env:VERSION."
+          }
+          if ($file.Length -lt 100000) {
+              throw "Размер файла слишком мал: $($file.Length) байт."
+          }
+
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksum = Join-Path $env:GITHUB_WORKSPACE 'SHA256SUMS.txt'
+          "$hash  NetLimiterParser.exe" |
+              Set-Content -LiteralPath $checksum -Encoding ascii
+
+          Write-Host "File version: $actualVersion"
+          Write-Host "Size: $($file.Length) bytes"
+          Write-Host "SHA256: $hash"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetLimiterParser-${{ steps.version.outputs.tag }}
+          path: |
+            NetLimiterParser.exe
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          DISPLAY_VERSION: ${{ steps.version.outputs.display }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          $title = "NetLimiter Parser $env:DISPLAY_VERSION"
+
+          gh release view $env:TAG --repo $env:GH_REPO *> $null
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "Релиз $env:TAG уже существует — заменяю файлы."
+              gh release upload $env:TAG NetLimiterParser.exe SHA256SUMS.txt --repo $env:GH_REPO --clobber
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Не удалось загрузить файлы в существующий релиз."
+              }
+
+              $editArguments = @(
+                  'release', 'edit', $env:TAG,
+                  '--repo', $env:GH_REPO,
+                  '--title', $title,
+                  "--prerelease=$($env:PRERELEASE)",
+                  "--draft=$($env:DRAFT)"
+              )
+              gh @editArguments
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Не удалось обновить параметры релиза."
+              }
+          } else {
+              $buildNotes = "Сборка GitHub Actions: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+              $arguments = @(
+                  'release', 'create', $env:TAG,
+                  'NetLimiterParser.exe',
+                  'SHA256SUMS.txt',
+                  '--repo', $env:GH_REPO,
+                  '--target', $env:GITHUB_SHA,
+                  '--title', $title,
+                  '--generate-notes',
+                  '--notes', $buildNotes
+              )
+              if ($env:PRERELEASE -eq 'true') { $arguments += '--prerelease' }
+              if ($env:DRAFT -eq 'true') { $arguments += '--draft' }
+
+              gh @arguments
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Не удалось создать релиз."
+              }
+          }
+
+          $releaseUrl = gh release view $env:TAG --repo $env:GH_REPO --json url --jq .url
+          if ($LASTEXITCODE -eq 0 -and $releaseUrl) {
+              Write-Host "Release: $releaseUrl"
+              "### Релиз`n$releaseUrl" |
+                  Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          }

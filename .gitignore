@@ -1,0 +1,13 @@
+# Сборка
+NetLimiterParser.exe
+*.pdb
+SHA256SUMS.txt
+
+# Временные файлы
+_probe/
+*.tmp
+*.log
+
+# IDE
+.vs/
+*.user
